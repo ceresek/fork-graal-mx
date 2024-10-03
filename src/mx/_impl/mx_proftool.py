@@ -25,6 +25,7 @@
 # ----------------------------------------------------------------------------------------------------
 
 import copy
+import csv
 import io
 import json
 import os
@@ -711,6 +712,10 @@ class CompiledCodeInfo:
         self.methods = methods
         self.nmethod = None
         self.basic_blocks = None
+        # Added for warm up profiling
+        self.level = 'native'
+        self.last_event_time = 0
+
 
     def __str__(self):
         return f"0x{self.code_begin():x}-0x{self.code_end():x} {self.name} {self.timestamp}-{self.unload_time or ''}"
@@ -765,6 +770,7 @@ class CompiledCodeInfo:
         self.events.append(event)
         self.total_period += event.period
         self.total_samples += event.samples
+        self.last_event_time = max (self.last_event_time, event.timestamp)
         if self.basic_blocks:
             # if we have basic block information, we search for the basic block the sample belongs to
             for b in self.basic_blocks:
@@ -1131,7 +1137,7 @@ class PerfOutput:
         with files.open_perf_output_file() as fp:
             self.read_perf_output(fp)
 
-        self.merge_perf_events()
+        # self.merge_perf_events()
 
     @staticmethod
     def is_supported():
@@ -1176,19 +1182,19 @@ class PerfOutput:
                 raise AssertionError('Unable to parse perf output: ' + line)
         self.total_samples = len(self.events)
 
-    def merge_perf_events(self):
-        """Collect repeated events at the same pc into a single PerfEvent."""
-        self.raw_events = self.events
-        events_by_address = {}
-        for event in self.events:
-            e = events_by_address.get(event.pc)
-            if e:
-                e.period = e.period + event.period
-                e.samples = e.samples + event.samples
-            else:
-                # avoid mutating the underlying raw event
-                events_by_address[event.pc] = copy.copy(event)
-        self.events = events_by_address.values()
+    # def merge_perf_events(self):
+    #     """Collect repeated events at the same pc into a single PerfEvent."""
+    #     self.raw_events = self.events
+    #     events_by_address = {}
+    #     for event in self.events:
+    #         e = events_by_address.get(event.pc)
+    #         if e:
+    #             e.period = e.period + event.period
+    #             e.samples = e.samples + event.samples
+    #         else:
+    #             # avoid mutating the underlying raw event
+    #             events_by_address[event.pc] = copy.copy(event)
+    #     self.events = events_by_address.values()
 
     def get_top_methods(self):
         """Get a list of symbols and event counts sorted by hottest first."""
@@ -1286,6 +1292,7 @@ class GeneratedAssembly:
                 if matches:
                     found = matches.pop(0)
                     code.set_nmethod(found)
+                    code.level = found.level
                     self.code_by_id[code.get_compile_id()] = code
                     continue
                 mx.abort(f'Unable to find matching nmethod for code {code}')
@@ -1850,6 +1857,93 @@ def profhot(args):
                            short_class_names=options.short_class_names)
     if fp != sys.stdout:
         fp.close()
+
+
+@mx.command('mx', 'profwarm', '[options]')
+@mx.suite_context_free
+def profwarm(args):
+    """Display the warm up profile"""
+    parser = ArgumentParser(prog='mx profwarm',
+                            description='Display the warm up profile',
+                            formatter_class=RawTextHelpFormatter)
+
+    parser.add_argument(
+        '--profile-step',
+        help='Collect profile with given time step [s]',
+        action='store',
+        default=1.0,
+        type=float)
+
+    parser.add_argument(
+        '--interim-threshold',
+        help='Methods not observed in run tail of this length will be considered interim [s]',
+        action='store',
+        default=60.0,
+        type=float)
+
+    parser.add_argument('-o', '--output', help='Write output to named file. Writes to stdout by default.', action='store')
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('-E', '--experiment', help='The directory containing the data files from the experiment', action='store', required=False)
+    group.add_argument('experiment', help='The directory containing the data files from the experiment', action=SuppressNoneArgs, nargs=OPTIONAL)
+
+    options = parser.parse_args(args)
+    files = ExperimentFiles.open(options)
+    files.ensure_perf_output()
+    perf_data = PerfOutput(files)
+
+    fp = sys.stdout
+    if options.output:
+        fp = open(options.output, 'w')
+
+    assembly = GeneratedAssembly(files)
+    assembly.attribute_events(perf_data)
+
+    LEVEL_UNKNOWN = 'unknown'
+
+    initial_timestamp = perf_data.events [0].timestamp
+    interim_threshold = perf_data.events [-1].timestamp - options.interim_threshold
+
+    profile = {}
+    profile_counters = {}
+    profile_timestamp = initial_timestamp
+
+    for event in perf_data.events:
+
+        # Add profile report every profile step.
+        if event.timestamp > profile_timestamp + options.profile_step:
+            profile_timestamp += options.profile_step
+            profile [profile_timestamp - initial_timestamp] = profile_counters
+            profile_counters = {}
+
+        code_info = None
+        if assembly.low_address <= event.pc < assembly.high_address:
+            code_info = assembly.find (event.pc, event.timestamp)
+
+        if code_info:
+            level = str (code_info.level)
+            if code_info.last_event_time < interim_threshold:
+                level += 'I'
+            profile_counters [level] = profile_counters.get (level, 0) + 1
+        else:
+            profile_counters [LEVEL_UNKNOWN] = profile_counters.get (LEVEL_UNKNOWN, 0) + 1
+
+    # Last profile step incomplete. So what.
+
+    profile_columns = set ()
+    for counters in profile.values ():
+        profile_columns.update (counters.keys ())
+    profile_columns = sorted (list (profile_columns))
+
+    output_writer = csv.writer (fp)
+    output_writer.writerow ([ 'time' ] + profile_columns)
+    for profile_time in sorted (profile.keys ()):
+        profile_counters = [ profile [profile_time].get (column, 0) for column in profile_columns ]
+        output_writer.writerow ([ profile_time ] + profile_counters)
+
+    if fp != sys.stdout:
+        fp.close()
+
 
 @mx.command('mx', 'checkblocks', '[options]')
 @mx.suite_context_free
